@@ -92,7 +92,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Умный поиск директории
+    // search
     let source_dir = find_config_dir(&temp_repo);
 
     let mode_idx = FuzzySelect::with_theme(&ColorfulTheme::default())
@@ -114,7 +114,7 @@ fn main() -> Result<()> {
         }
     };
 
-    // Фильтр: убираем мусор, оставляем только важное
+    // filter
     let entries: Vec<_> = fs::read_dir(&source_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -142,10 +142,10 @@ fn main() -> Result<()> {
         let name = &names[idx];
         let src = entries[idx].path();
 
-        // Проверка зависимостей перед установкой
+        // hi!
         check_and_install_dep(name, &l)?;
 
-        // Умный путь установки: файлы в ~, папки в .config
+        // install
         let dest = if src.is_file() { home.join(name) } else { target_root.join(name) };
 
         if dest.exists() && !dest.is_symlink() {
@@ -156,7 +156,7 @@ fn main() -> Result<()> {
             if dest.is_dir() { fs::remove_dir_all(&dest)?; } else { fs::remove_file(&dest)?; }
         }
 
-        // Копируем (можно заменить на symlink по желанию)
+        // copying
         if src.is_dir() {
             copy_dir_all(&src, &dest)?;
         } else {
@@ -180,7 +180,6 @@ fn find_config_dir(repo: &Path) -> PathBuf {
         if p.is_dir() { return p; }
     }
     
-    // Если в корне есть папки-конфиги, работаем от корня
     let common = ["hypr", "waybar", "kitty", "nvim", "rofi", "fish", "zsh"];
     if let Ok(rd) = fs::read_dir(repo) {
         for e in rd.flatten() {
@@ -203,7 +202,7 @@ fn check_and_install_dep(name: &str, l: &Lang) -> Result<()> {
         _ => return Ok(()),
     };
 
-    // Проверяем, есть ли бинарник или установлен ли пакет через pacman
+    // install 2
     if which(name).is_err() && Command::new("pacman").args(["-Qi", pkg_name]).output()?.status.success() == false {
         if Confirm::with_theme(&ColorfulTheme::default())
             .with_prompt(l.dep_prompt.replace("{}", pkg_name))
