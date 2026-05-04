@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use chrono::Local;
 use console::{style, Term};
-use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input, MultiSelect};
+use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input, MultiSelect, Confirm};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use which::which;
 
 struct Lang {
     welcome: &'static str,
@@ -20,6 +21,7 @@ struct Lang {
     cleaning: &'static str,
     done: &'static str,
     error_git: &'static str,
+    dep_prompt: &'static str,
 }
 
 const RU: Lang = Lang {
@@ -30,11 +32,12 @@ const RU: Lang = Lang {
     modes: ["Системный каталог (~/.config)", "Пользовательский путь"],
     path_prompt: "Укажите путь",
     select_prompt: "Выберите компоненты (Space - выбор, Enter - подтверждение)",
-    copying: "Копирование",
+    copying: "Установка",
     backup_msg: "Резервная копия:",
     cleaning: "Очистка кэша...",
     done: "Установка завершена успешно.",
     error_git: "Ошибка клонирования репозитория.",
+    dep_prompt: "Пакет '{}' не найден. Установить его через yay?",
 };
 
 const EN: Lang = Lang {
@@ -45,11 +48,12 @@ const EN: Lang = Lang {
     modes: ["System config (~/.config)", "Custom path"],
     path_prompt: "Specify path",
     select_prompt: "Select components (Space - select, Enter - confirm)",
-    copying: "Copying",
+    copying: "Installing",
     backup_msg: "Backup created:",
     cleaning: "Cleaning cache...",
     done: "Installation completed successfully.",
     error_git: "Repository clone error.",
+    dep_prompt: "Package '{}' not found. Install it via yay?",
 };
 
 fn main() -> Result<()> {
@@ -64,8 +68,8 @@ fn main() -> Result<()> {
 
     let l = if lang_idx == 0 { RU } else { EN };
 
-    println!("\n{}", style(l.welcome).bold());
-    println!("{}", style("—".repeat(30)).dim());
+    println!("\n{}", style(l.welcome).bold().cyan());
+    println!("{}", style("—".repeat(40)).dim());
 
     let repo_url: String = Input::with_theme(&ColorfulTheme::default())
         .with_prompt(l.repo_prompt)
@@ -88,6 +92,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Умный поиск директории
     let source_dir = find_config_dir(&temp_repo);
 
     let mode_idx = FuzzySelect::with_theme(&ColorfulTheme::default())
@@ -109,9 +114,17 @@ fn main() -> Result<()> {
         }
     };
 
+    // Фильтр: убираем мусор, оставляем только важное
     let entries: Vec<_> = fs::read_dir(&source_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir() && !e.file_name().to_string_lossy().starts_with('.'))
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            !name.starts_with('.') && 
+            name != "readme.md" && 
+            name != "license" && 
+            name != "target" &&
+            name != "pkgbuild"
+        })
         .collect();
 
     let names: Vec<_> = entries
@@ -125,39 +138,35 @@ fn main() -> Result<()> {
         .defaults(&vec![true; names.len()])
         .interact()?;
 
-    let pb = ProgressBar::new(chosen_indices.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.cyan} [{bar:30.white/black}] {pos}/{len} {msg}")?
-            .progress_chars("=>-"),
-    );
-
     for &idx in &chosen_indices {
         let name = &names[idx];
         let src = entries[idx].path();
-        let dest = target_root.join(name);
 
-        pb.set_message(format!("{}: {}", l.copying, name));
+        // Проверка зависимостей перед установкой
+        check_and_install_dep(name, &l)?;
 
-        if mode_idx == 0 && dest.exists() && !dest.is_symlink() {
+        // Умный путь установки: файлы в ~, папки в .config
+        let dest = if src.is_file() { home.join(name) } else { target_root.join(name) };
+
+        if dest.exists() && !dest.is_symlink() {
             backup_config(&dest, l.backup_msg)?;
         }
 
         if dest.exists() {
-            if dest.is_dir() {
-                fs::remove_dir_all(&dest)?;
-            } else {
-                fs::remove_file(&dest)?;
-            }
+            if dest.is_dir() { fs::remove_dir_all(&dest)?; } else { fs::remove_file(&dest)?; }
         }
 
-        copy_dir_all(&src, &dest)?;
-        pb.inc(1);
+        // Копируем (можно заменить на symlink по желанию)
+        if src.is_dir() {
+            copy_dir_all(&src, &dest)?;
+        } else {
+            fs::copy(&src, &dest)?;
+        }
+        
+        println!("  {} {} -> {}", style("󰄬").green(), name, dest.display());
     }
 
-    pb.finish_and_clear();
-    
-    println!("{}", style(l.cleaning).dim());
+    println!("\n{}", style(l.cleaning).dim());
     fs::remove_dir_all(&temp_repo)?;
 
     println!("\n{}", style(l.done).bold().green());
@@ -165,28 +174,56 @@ fn main() -> Result<()> {
 }
 
 fn find_config_dir(repo: &Path) -> PathBuf {
-    for v in ["config", ".config"] {
-        let p = repo.join(v);
-        if p.exists() && p.is_dir() {
-            return p;
+    let hints = ["config", ".config", "dotfiles", "dots"];
+    for h in hints {
+        let p = repo.join(h);
+        if p.is_dir() { return p; }
+    }
+    
+    // Если в корне есть папки-конфиги, работаем от корня
+    let common = ["hypr", "waybar", "kitty", "nvim", "rofi", "fish", "zsh"];
+    if let Ok(rd) = fs::read_dir(repo) {
+        for e in rd.flatten() {
+            if common.contains(&e.file_name().to_string_lossy().as_ref()) {
+                return repo.to_path_buf();
+            }
         }
     }
     repo.to_path_buf()
 }
 
+fn check_and_install_dep(name: &str, l: &Lang) -> Result<()> {
+    // Список маппинга папок на пакеты (можно расширять)
+    let pkg_name = match name {
+        "hypr" => "hyprland-git",
+        "waybar" => "waybar-hyprland",
+        "nvim" => "neovim",
+        "kitty" => "kitty",
+        "rofi" => "rofi-lbonn-wayland-git",
+        _ => return Ok(()),
+    };
+
+    // Проверяем, есть ли бинарник или установлен ли пакет через pacman
+    if which(name).is_err() && Command::new("pacman").args(["-Qi", pkg_name]).output()?.status.success() == false {
+        if Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt(l.dep_prompt.replace("{}", pkg_name))
+            .default(true)
+            .interact()? 
+        {
+            Command::new("yay").args(["-S", "--noconfirm", pkg_name]).status()?;
+        }
+    }
+    Ok(())
+}
+
 fn backup_config(path: &Path, msg: &str) -> Result<()> {
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-    let backup_root = dirs::home_dir().unwrap().join(".dotfiles_backup").join(timestamp.to_string());
-    fs::create_dir_all(&backup_root)?;
-
-    let name = path.file_name().unwrap();
-    let dest = backup_root.join(name);
-
-    Command::new("cp")
-        .args(["-r", path.to_str().unwrap(), dest.to_str().unwrap()])
-        .status()?;
-
-    println!("\r{} {:?}", msg, backup_root);
+    let backup_dir = dirs::home_dir().unwrap().join(".dotmaster_backups").join(timestamp.to_string());
+    fs::create_dir_all(&backup_dir)?;
+    
+    let dest = backup_dir.join(path.file_name().unwrap());
+    Command::new("cp").args(["-r", path.to_str().unwrap(), dest.to_str().unwrap()]).status()?;
+    println!("{} {:?}", style(msg).yellow(), dest);
     Ok(())
 }
 
@@ -194,7 +231,8 @@ fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
     fs::create_dir_all(&dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
             copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
         } else {
             fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
